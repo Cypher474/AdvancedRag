@@ -1,0 +1,159 @@
+from langchain_pinecone import PineconeVectorStore
+from pinecone import Pinecone
+from langchain_openai import OpenAIEmbeddings, OpenAI
+from langchain_core.documents import Document
+# from langchain.retrievers.self_query import SelfQueryRetriever
+from langchain.retrievers.multi_query import MultiQueryRetriever
+from langchain.retrievers import ParentDocumentRetriever
+from langchain_pinecone import PineconeVectorStore
+from langchain.prompts import PromptTemplate
+from langchain_core.output_parsers import CommaSeparatedListOutputParser
+from dotenv import load_dotenv  
+import os
+
+# Load environment variables
+load_dotenv()
+
+# Loading API keys from .env
+pinekey = os.getenv("PINECONE_KEY")
+openaikey = os.getenv("OPENAI_API_KEY")
+
+# Initializing Pinecone and OpenAI clients
+pc = Pinecone(api_key=pinekey)
+client = OpenAI(api_key=openaikey)
+
+# Check existing indexes
+index_name = "langchain-pdf-metadata"
+
+# Connect to the Pinecone index
+index = pc.Index(index_name)
+
+# Set up embeddings
+embeddings = OpenAIEmbeddings(openai_api_key=openaikey)
+
+# Connect to the existing Pinecone index with Langchain
+vector_store = PineconeVectorStore(index=index, embedding=embeddings)
+
+# Create a default retriever
+retriever = vector_store.as_retriever()
+
+# Function to perform basic retrieval
+def basic_retrieval(query):
+    docs = retriever.get_relevant_documents(query)
+    print("Documents retrieved (default retriever):")
+    for i, doc in enumerate(docs, start=1):
+        print(f"Doc {i}: {doc.page_content}")
+
+# Function to perform MMR retrieval
+def mmr_retrieval(query):
+    retriever_mmr = vector_store.as_retriever(search_type="mmr")
+    docs_mmr = retriever_mmr.get_relevant_documents(query)
+    print("Documents retrieved (MMR retriever):")
+    for i, doc in enumerate(docs_mmr, start=1):
+        print(f"Doc {i}: {doc.page_content}")
+
+# Function to perform threshold-based retrieval
+def threshold_retrieval(query, threshold=0.5):
+    retriever_with_threshold = vector_store.as_retriever(
+        search_type="similarity_score_threshold", 
+        search_kwargs={"score_threshold": threshold}
+    )
+    docs_with_threshold = retriever_with_threshold.get_relevant_documents(query)
+    print("Documents retrieved (Threshold-based retriever):")
+    for i, doc in enumerate(docs_with_threshold, start=1):
+        print(f"Doc {i}: {doc.page_content}")
+
+# Function to perform self-query retrieval
+# def self_query_retrieval(query):
+#     # Define prompt for self-query retriever
+#     prompt_template = PromptTemplate(
+#         input_variables=["query", "answer"], 
+#         template="Given the query: {query}, generate a refined query for retrieving relevant documents."
+#     )
+
+#     llm = OpenAI(api_key=openaikey)
+
+#     # Initialize the self-query retriever
+#     self_query_retriever = SelfQueryRetriever.from_llm(
+#         retriever=vector_store.as_retriever(),
+#         llm=llm,
+#         prompt_template=prompt_template
+#     )
+
+#     # Perform self-query retrieval
+#     retrieved_docs = self_query_retriever.get_relevant_documents(query)
+#     print("Documents retrieved (Self-Query retriever):")
+#     for i, doc in enumerate(retrieved_docs, start=1):
+#         print(f"Doc {i}: {doc.page_content}")
+
+# Function to perform multi-query retrieval
+def multi_query_retrieval(query, num_queries=3):
+    # Output parser to split the LLM result into a list of queries
+    output_parser = CommaSeparatedListOutputParser()
+
+    # Updated PromptTemplate for generating multiple queries
+    QUERY_PROMPT = PromptTemplate(
+        input_variables=["question", "num_queries"],
+        template="""You are an AI language model assistant. Your task is to generate {num_queries} 
+        different versions of the given user question to retrieve relevant documents from a vector 
+        database. By generating multiple perspectives on the user question, your goal is to help
+        the user overcome some of the limitations of the distance-based similarity search. 
+        Provide these alternative questions separated by commas.
+        Original question: {question}"""
+    )
+
+    # Define the chain combining the prompt, LLM, and output parser
+    llm_chain = (QUERY_PROMPT | client | output_parser).with_config(
+        {"output_parser": {"parse": lambda x: x}}
+    )
+
+    # Initialize MultiQueryRetriever without the num_queries argument
+    multi_query_retriever = MultiQueryRetriever.from_llm(
+        retriever=vector_store.as_retriever(),
+        llm=client,  # Pass the LLM chain
+        include_original=True  # Optionally include the original query
+    )
+
+    # Perform multi-query retrieval
+    retrieved_docs_multi = multi_query_retriever.get_relevant_documents(query)
+    
+    print("Documents retrieved (Multi-Query retriever):")
+    for i, doc in enumerate(retrieved_docs_multi, start=1):
+        print(f"Doc {i}: {doc.page_content}")
+
+
+
+# Function to perform parent document retrieval
+def parent_document_retrieval(query):
+    # Initialize the parent document retriever
+    parent_retriever = ParentDocumentRetriever.from_retriever(
+        retriever=vector_store.as_retriever()
+    )
+
+    # Perform parent document retrieval
+    retrieved_parent_docs = parent_retriever.get_relevant_documents(query)
+    print("Documents retrieved (Parent Document retriever):")
+    for i, doc in enumerate(retrieved_parent_docs, start=1):
+        print(f"Parent Doc {i}: {doc.page_content}")
+
+# Example query to test all functions
+query = "What was the blade of Arthas Menethil?"
+
+# Test each retrieval function
+print("\n--- Basic Retrieval ---")
+#basic_retrieval(query)
+
+print("\n--- MMR Retrieval ---")
+#mmr_retrieval(query)
+
+print("\n--- Threshold Retrieval ---")
+# threshold_retrieval(query, threshold=0.5)
+
+print("\n--- Self-Query Retrieval ---")
+# self_query_retrieval(query)
+
+print("\n--- Multi-Query Retrieval ---")
+multi_query_retrieval(query, num_queries=3)
+
+print("\n--- Parent Document Retrieval ---")
+parent_document_retrieval(query)
