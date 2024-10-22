@@ -1,159 +1,279 @@
 from langchain_pinecone import PineconeVectorStore
 from pinecone import Pinecone
-from langchain_openai import OpenAIEmbeddings, OpenAI
+from langchain_openai import OpenAIEmbeddings, OpenAI, ChatOpenAI
 from langchain_core.documents import Document
-# from langchain.retrievers.self_query import SelfQueryRetriever
 from langchain.retrievers.multi_query import MultiQueryRetriever
-from langchain.retrievers import ParentDocumentRetriever
-from langchain_pinecone import PineconeVectorStore
 from langchain.prompts import PromptTemplate
 from langchain_core.output_parsers import CommaSeparatedListOutputParser
-from dotenv import load_dotenv  
+from langchain.retrievers.self_query.base import SelfQueryRetriever
+from langchain.retrievers import ContextualCompressionRetriever
+from langchain_community.retrievers import CohereRagRetriever
+from langchain.retrievers.document_compressors import FlashrankRerank
+from langchain_community.retrievers import BM25Retriever
+from dotenv import load_dotenv
 import os
 
-# Load environment variables
+# Load API keys from .env file
 load_dotenv()
+PINECONE_KEY = os.getenv("PINECONE_KEY")
+OPENAI_KEY = os.getenv("OPENAI_API_KEY")
 
-# Loading API keys from .env
-pinekey = os.getenv("PINECONE_KEY")
-openaikey = os.getenv("OPENAI_API_KEY")
-
-# Initializing Pinecone and OpenAI clients
-pc = Pinecone(api_key=pinekey)
-client = OpenAI(api_key=openaikey)
-
-# Check existing indexes
-index_name = "langchain-pdf-metadata"
-
-# Connect to the Pinecone index
-index = pc.Index(index_name)
-
-# Set up embeddings
-embeddings = OpenAIEmbeddings(openai_api_key=openaikey)
-
-# Connect to the existing Pinecone index with Langchain
-vector_store = PineconeVectorStore(index=index, embedding=embeddings)
-
-# Create a default retriever
-retriever = vector_store.as_retriever()
-
-# Function to perform basic retrieval
-def basic_retrieval(query):
-    docs = retriever.get_relevant_documents(query)
-    print("Documents retrieved (default retriever):")
-    for i, doc in enumerate(docs, start=1):
-        print(f"Doc {i}: {doc.page_content}")
-
-# Function to perform MMR retrieval
-def mmr_retrieval(query):
-    retriever_mmr = vector_store.as_retriever(search_type="mmr")
-    docs_mmr = retriever_mmr.get_relevant_documents(query)
-    print("Documents retrieved (MMR retriever):")
-    for i, doc in enumerate(docs_mmr, start=1):
-        print(f"Doc {i}: {doc.page_content}")
-
-# Function to perform threshold-based retrieval
-def threshold_retrieval(query, threshold=0.5):
-    retriever_with_threshold = vector_store.as_retriever(
-        search_type="similarity_score_threshold", 
-        search_kwargs={"score_threshold": threshold}
-    )
-    docs_with_threshold = retriever_with_threshold.get_relevant_documents(query)
-    print("Documents retrieved (Threshold-based retriever):")
-    for i, doc in enumerate(docs_with_threshold, start=1):
-        print(f"Doc {i}: {doc.page_content}")
-
-# Function to perform self-query retrieval
-# def self_query_retrieval(query):
-#     # Define prompt for self-query retriever
-#     prompt_template = PromptTemplate(
-#         input_variables=["query", "answer"], 
-#         template="Given the query: {query}, generate a refined query for retrieving relevant documents."
-#     )
-
-#     llm = OpenAI(api_key=openaikey)
-
-#     # Initialize the self-query retriever
-#     self_query_retriever = SelfQueryRetriever.from_llm(
-#         retriever=vector_store.as_retriever(),
-#         llm=llm,
-#         prompt_template=prompt_template
-#     )
-
-#     # Perform self-query retrieval
-#     retrieved_docs = self_query_retriever.get_relevant_documents(query)
-#     print("Documents retrieved (Self-Query retriever):")
-#     for i, doc in enumerate(retrieved_docs, start=1):
-#         print(f"Doc {i}: {doc.page_content}")
-
-# Function to perform multi-query retrieval
-def multi_query_retrieval(query, num_queries=3):
-    # Output parser to split the LLM result into a list of queries
-    output_parser = CommaSeparatedListOutputParser()
-
-    # Updated PromptTemplate for generating multiple queries
-    QUERY_PROMPT = PromptTemplate(
-        input_variables=["question", "num_queries"],
-        template="""You are an AI language model assistant. Your task is to generate {num_queries} 
-        different versions of the given user question to retrieve relevant documents from a vector 
-        database. By generating multiple perspectives on the user question, your goal is to help
-        the user overcome some of the limitations of the distance-based similarity search. 
-        Provide these alternative questions separated by commas.
-        Original question: {question}"""
-    )
-
-    # Define the chain combining the prompt, LLM, and output parser
-    llm_chain = (QUERY_PROMPT | client | output_parser).with_config(
-        {"output_parser": {"parse": lambda x: x}}
-    )
-
-    # Initialize MultiQueryRetriever without the num_queries argument
-    multi_query_retriever = MultiQueryRetriever.from_llm(
-        retriever=vector_store.as_retriever(),
-        llm=client,  # Pass the LLM chain
-        include_original=True  # Optionally include the original query
-    )
-
-    # Perform multi-query retrieval
-    retrieved_docs_multi = multi_query_retriever.get_relevant_documents(query)
+# Initialize main services
+def setup_services():
+    """Set up Pinecone and OpenAI services"""
+    pinecone = Pinecone(api_key=PINECONE_KEY)
+    openai = OpenAI(api_key=OPENAI_KEY)
+    embeddings = OpenAIEmbeddings(openai_api_key=OPENAI_KEY)
     
-    print("Documents retrieved (Multi-Query retriever):")
-    for i, doc in enumerate(retrieved_docs_multi, start=1):
-        print(f"Doc {i}: {doc.page_content}")
+    # Connect to Pinecone index
+    index = pinecone.Index("langchain-pdf-metadata")
+    vector_store = PineconeVectorStore(index=index, embedding=embeddings)
+    
+    return openai, vector_store
 
+# Helper function to print document details
+def print_document(doc, number):
+    """Print document content and metadata in a readable format"""
+    print(f"\nDocument {number}:")
+    print(f"Content: {doc.page_content}")
+    
+    # Print metadata if available
+    metadata = doc.metadata
+    if 'score' in metadata:
+        print(f"Score: {metadata['score']}")
+    if 'source' in metadata:
+        print(f"Source: {metadata['source']}")
+    if 'summary' in metadata:
+        print(f"Summary: {metadata['summary']}")
+    print("-" * 50)
 
+# Add scores to documents
+def add_scores_to_docs(docs, query, vector_store):
+    """Add similarity scores to documents"""
+    # Get similarity scores for the documents
+    results = vector_store.similarity_search_with_score(query, k=len(docs))
+    scores = [score for _, score in results]
+    
+    # Add scores to document metadata
+    for doc, score in zip(docs, scores):
+        doc.metadata["score"] = score
+    
+    return docs
 
-# Function to perform parent document retrieval
-def parent_document_retrieval(query):
-    # Initialize the parent document retriever
-    parent_retriever = ParentDocumentRetriever.from_retriever(
-        retriever=vector_store.as_retriever()
+# Basic search function
+def simple_search(vector_store, query):
+    """Perform a basic similarity search"""
+    print("\n=== Basic Search Results ===")
+    results = vector_store.similarity_search_with_score(query)
+    
+    for i, (doc, score) in enumerate(results, 1):
+        doc.metadata["score"] = score
+        print_document(doc, i)
+
+# Keyword filtered search
+def keyword_search(vector_store, query, keyword="Arthas"):
+    """Search documents and filter by keyword"""
+    print(f"\n=== Search Results (Filtered by '{keyword}') ===")
+    results = vector_store.similarity_search_with_score(query)
+    
+    filtered_results = [
+        (doc, score) for doc, score in results
+        if keyword.lower() in doc.metadata.get('summary', '').lower()
+    ]
+    
+    for i, (doc, score) in enumerate(filtered_results, 1):
+        doc.metadata['score'] = score
+        print_document(doc, i)
+
+# Advanced search using MMR (Maximum Marginal Relevance)
+def mmr_search(vector_store, query):
+    """Perform search using MMR for diverse results"""
+    print("\n=== MMR Search Results ===")
+    retriever = vector_store.as_retriever(search_type="mmr")
+    docs = retriever.invoke(query)
+    
+    # Add scores to documents
+    docs = add_scores_to_docs(docs, query, vector_store)
+    
+    for i, doc in enumerate(docs, 1):
+        print_document(doc, i)
+
+# Search with minimum score threshold
+def threshold_search(vector_store, query, min_score=0.5):
+    """Search documents with a minimum score requirement"""
+    print(f"\n=== Search Results (Minimum Score: {min_score}) ===")
+    retriever = vector_store.as_retriever(
+        search_type="similarity_score_threshold",
+        search_kwargs={"score_threshold": min_score}
     )
+    
+    docs = retriever.invoke(query)
+    docs = add_scores_to_docs(docs, query, vector_store)
+    
+    for i, doc in enumerate(docs, 1):
+        print_document(doc, i)
 
-    # Perform parent document retrieval
-    retrieved_parent_docs = parent_retriever.get_relevant_documents(query)
-    print("Documents retrieved (Parent Document retriever):")
-    for i, doc in enumerate(retrieved_parent_docs, start=1):
-        print(f"Parent Doc {i}: {doc.page_content}")
+# Multi-query search for better coverage
+def multi_query_search(vector_store, openai, query, num_variations=3):
+    """Search using multiple variations of the query"""
+    print("\n=== Multi-Query Search Results ===")
+    
+    # Create query variations template
+    template = """Generate {num_queries} different versions of this question:
+    Original: {question}
+    Make each version unique to help find relevant documents."""
+    
+    prompt = PromptTemplate(
+        input_variables=["question", "num_queries"],
+        template=template
+    )
+    
+    # Set up and run multi-query retriever
+    retriever = MultiQueryRetriever.from_llm(
+        retriever=vector_store.as_retriever(),
+        llm=openai,
+        include_original=True
+    )
+    
+    docs = retriever.invoke(query)
+    docs = add_scores_to_docs(docs, query, vector_store)
+    
+    for i, doc in enumerate(docs, 1):
+        print_document(doc, i)
 
-# Example query to test all functions
-query = "What was the blade of Arthas Menethil?"
 
-# Test each retrieval function
-print("\n--- Basic Retrieval ---")
-#basic_retrieval(query)
+def bm25_search(query: str, documents: list = None):
+    """
+    Perform BM25 search on documents
+    
+    Args:
+        query (str): Search query
+        documents (list, optional): List of documents to search through. 
+                                  If None, uses default documents.
+    """
+    print("\n=== BM25 Search Results ===")
+    
+    # If no documents provided, create sample documents
+    if documents is None:
+        documents = [
+            Document(
+                page_content="Frostmourne was the runeblade that Arthas Menethil took up in Northrend.",
+                metadata={"source": "warcraft_lore", "type": "weapon"}
+            ),
+            Document(
+                page_content="The Lich King's armor was forged by the Nathrezim.",
+                metadata={"source": "warcraft_lore", "type": "armor"}
+            ),
+            Document(
+                page_content="Arthas was the crown prince of Lordaeron before becoming the Lich King.",
+                metadata={"source": "warcraft_lore", "type": "character"}
+            ),
+            Document(
+                page_content="The Helm of Domination was part of the Lich King's power.",
+                metadata={"source": "warcraft_lore", "type": "armor"}
+            )
+        ]
+    
+    # Initialize BM25 retriever
+    retriever = BM25Retriever.from_documents(documents)
+    
+    # Perform search
+    results = retriever.invoke(query)
+    
+    # Print results
+    print(f"\nQuery: {query}")
+    print(f"Found {len(results)} documents")
+    print(results)
+    
+    for i, doc in enumerate(results, 1):
+        # Add a simple score based on position (BM25 doesn't provide actual scores)
+        doc.metadata["score"] = 1.0 / i  # Simple position-based scoring
+        print_document(doc, i)
+        
+    return results
 
-print("\n--- MMR Retrieval ---")
-#mmr_retrieval(query)
 
-print("\n--- Threshold Retrieval ---")
-# threshold_retrieval(query, threshold=0.5)
+def compare_compression_results(vector_store, query, num_results=5):
+    """Compare documents before and after compression"""
+    print("\n=== Compression Comparison Results ===")
+    print(f"Query: {query}")
+    
+    # Get original documents
+    print("\n--- Original Documents ---")
+    base_retriever = vector_store.as_retriever(
+        search_kwargs={"k": num_results}
+    )
+    original_docs = base_retriever.invoke(query)
+    original_docs = add_scores_to_docs(original_docs, query, vector_store)
+    
+    print(f"Found {len(original_docs)} original documents")
+    for i, doc in enumerate(original_docs, 1):
+        print_document(doc, i)
+        
+    # Get compressed documents
+    print("\n--- Compressed Documents ---")
+    llm = ChatOpenAI(temperature=0, api_key=OPENAI_KEY)
+    compressor = FlashrankRerank()
+    compression_retriever = ContextualCompressionRetriever(
+        base_compressor=compressor,
+        base_retriever=base_retriever
+    )
+    
+    compressed_docs = compression_retriever.invoke(query)
+    compressed_docs = add_scores_to_docs(compressed_docs, query, vector_store)
+    
+    print(f"Found {len(compressed_docs)} compressed documents")
+    for i, doc in enumerate(compressed_docs, 1):
+        print_document(doc, i)
+        
+    # Print summary of changes
+    print("\n=== Compression Summary ===")
+    print(f"Original document count: {len(original_docs)}")
+    print(f"Compressed document count: {len(compressed_docs)}")
+    
+    # Compare document order changes
+    if len(original_docs) > 0 and len(compressed_docs) > 0:
+        print("\nDocument Reranking Changes:")
+        original_ids = [doc.metadata.get('id', f'Doc_{i}') for i, doc in enumerate(original_docs)]
+        compressed_ids = [doc.metadata.get('id', f'Doc_{i}') for i, doc in enumerate(compressed_docs)]
+        
+        for i, (orig_id, comp_id) in enumerate(zip(original_ids, compressed_ids), 1):
+            if orig_id != comp_id:
+                print(f"Position {i}: Changed from {orig_id} to {comp_id}")
+    
+    return original_docs, compressed_docs
 
-print("\n--- Self-Query Retrieval ---")
-# self_query_retrieval(query)
+def main():
+    # Initialize services
+    openai, vector_store = setup_services()
+    
+    # Example query
+    query = "What was the blade of Arthas Menethil?"
 
-print("\n--- Multi-Query Retrieval ---")
-multi_query_retrieval(query, num_queries=3)
+    vector_docs = vector_store.similarity_search(query, k=10)
 
-print("\n--- Parent Document Retrieval ---")
-parent_document_retrieval(query)
+    
+    # # Call each search function explicitly
+    # print("\nRunning Simple Search:")
+    # simple_search(vector_store, query)
+    
+    # print("\nRunning Keyword Search:")
+    # keyword_search(vector_store, query, keyword="Arthas")
+    
+    # print("\nRunning MMR Search:")
+    # mmr_search(vector_store, query)
+    
+    # print("\nRunning Threshold Search:")
+    # threshold_search(vector_store, query, min_score=0.5)
+    
+    # print("\nRunning Multi-Query Search:")
+    # multi_query_search(vector_store, openai, query, num_variations=3)
+
+    print("\nRunning BM25 Search:")
+    bm25_search(query, vector_docs)
+    
+    # print("\nRunning Compression Comparison:")
+    # compare_compression_results(vector_store, query, num_results=10)
+
+if __name__ == "__main__":
+    main()
